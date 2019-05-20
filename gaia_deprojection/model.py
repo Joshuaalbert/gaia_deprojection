@@ -6,7 +6,9 @@ import tensorflow_probability as tfp
 
 
 class GaiaEncoder(snt.AbstractModule):
-    """Use an EncodeProcessDecode graph network to compress starcluster graph"""
+    """Use an EncodeProcessDecode graph network to compress gaia graph.
+    Input - ra, dec, parallax, vra, vdec, vrad, V, VminI
+    """
 
     def __init__(self, global_output_size, latent_size=16, num_layers=2, name="GaiaEncoder"):
         super(GaiaEncoder, self).__init__(name=name)
@@ -22,7 +24,9 @@ class GaiaEncoder(snt.AbstractModule):
 
 
 class StarClusterEncoder(snt.AbstractModule):
-    """Use an EncodeProcessDecode graph network to compress starcluster graph"""
+    """Use an EncodeProcessDecode graph network to compress starcluster graph.
+    Input - x,y,z, vx, vy, vz, mass, age, metallicity
+    """
 
     def __init__(self, global_output_size, latent_size=16, num_layers=2, name="StarClusterEncoder"):
         super(StarClusterEncoder, self).__init__(name=name)
@@ -38,10 +42,18 @@ class StarClusterEncoder(snt.AbstractModule):
 
 
 class StarClusterDecoder(snt.AbstractModule):
-    """Use an EncodeProcessDecode graph network to compress starcluster graph"""
+    """Use an EncodeProcessDecode graph network to decompress starcluster graph.
 
-    def __init__(self, node_output_size, latent_size=16, num_layers=2, name="StarClusterDecoder"):
+    12 - vx,vy,vz, vx_scale,vy_scale,vz_scale, log_mass_mean, log_mass_scale, log_age_mean, log_age_scale, log_metallicity_mean, log_metallicity_sigma
+    """
+
+    SC_PROB_NODE_SIZE = 9
+
+    def __init__(self, node_output_size=None,
+                 latent_size=16, num_layers=2, name="StarClusterDecoder"):
         super(StarClusterDecoder, self).__init__(name=name)
+        if node_output_size is None:
+            node_output_size = self.SC_PROB_NODE_SIZE
         with self._enter_variable_scope():
             self._network = EncodeProcessDecode(edge_output_size=None,
                                                 node_output_size=node_output_size,
@@ -56,9 +68,6 @@ class StarClusterDecoder(snt.AbstractModule):
 class StarClusterTNetwork(snt.AbstractModule):
     """Use an EncodeProcessDecode graph network to compress starcluster graph"""
 
-    SC_NODE_SIZE = 9# x,y,z, vx, vy, vz, mass, age, metallicity
-    G_NODE_SIZE = 8# ra, dec, parallax, vra, vdec, vrad, V, VminI
-
     def __init__(self, encoded_size,
                  sc_encoder_latent_size=16,
                  sc_encoder_num_layers=2,
@@ -69,9 +78,14 @@ class StarClusterTNetwork(snt.AbstractModule):
                  name="StarClusterTNetwork"):
         super(StarClusterTNetwork, self).__init__(name=name)
 
-        self._starcluster_encoder = StarClusterEncoder(encoded_size, sc_encoder_latent_size, sc_encoder_num_layers)
-        self._starcluster_decoder = StarClusterDecoder(self.SC_NODE_SIZE, sc_decoder_latent_size, sc_decoder_num_layers)
-        self._gaia_encoder = GaiaEncoder(encoded_size, g_encoder_latent_size, g_encoder_num_layers)
+        self._starcluster_encoder = StarClusterEncoder(encoded_size,
+                                                       latent_size=sc_encoder_latent_size,
+                                                       num_layers=sc_encoder_num_layers)
+        self._starcluster_decoder = StarClusterDecoder(latent_size=sc_decoder_latent_size,
+                                                       num_layers=sc_decoder_num_layers)
+        self._gaia_encoder = GaiaEncoder(encoded_size,
+                                         latent_size=g_encoder_latent_size,
+                                         num_layers=g_encoder_num_layers)
 
     def _build(self, gaia_graph, starcluster_graph):
         sc_encoded = self._starcluster_encoder(starcluster_graph)[-1]
@@ -90,6 +104,32 @@ class StarClusterTNetwork(snt.AbstractModule):
                     sc_encoded_globals=sc_encoded.globals,
                     sc_decoded_graph=sc_decoded_graph,
                     g_decoded_graph=g_decoded_graph)
+
+class StarclusterProbabilityField(snt.AbstractModule):
+    def __init__(self, name='StarclusterProbabilityField'):
+        super(StarclusterProbabilityField, self).__init__(name=name)
+
+    def _build(self, decoded_starcluster, num_samples):
+        """
+        sample the decoded nodes into the corresponding reconstruction parameters.
+
+        :param decoded_starcluster: GraphTuple
+            The decoded graph. Nodes contain:
+
+        :param num_samples: tf.int32
+            The number of samples
+        :return:
+        """
+        # 12 - vx_mean, vy_mean, vz_mean, log_mass_mean, log_age_mean, log_metallicity_mean,  vx_scale,vy_scale,vz_scale,  log_mass_scale, log_age_scale, log_metallicity_scale
+        means = decoded_starcluster.nodes[:,0:6]
+        scales = decoded_starcluster.nodes[:,6:12]
+        shape = tf.concat([[num_samples],tf.shape(means)],axis=0)
+        samples = means + scales*tf.random.normal(shape=shape)
+        constrained = tf.concat([samples[:,:,0:3], tf.exp(samples[:,:,3:6])],axis=-1)
+        return dict(sampled_starcluster_graph=decoded_starcluster._replace(nodes=constrained))
+
+
+
 
 
 
