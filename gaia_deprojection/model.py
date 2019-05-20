@@ -64,6 +64,30 @@ class StarClusterDecoder(snt.AbstractModule):
     def _build(self, inputs):
         return self._network(inputs)
 
+class StarclusterProbabilityField(snt.AbstractModule):
+    def __init__(self, name='StarclusterProbabilityField'):
+        super(StarclusterProbabilityField, self).__init__(name=name)
+
+    def _build(self, decoded_starcluster, num_samples):
+        """
+        sample the decoded nodes into the corresponding reconstruction parameters.
+
+        :param decoded_starcluster: GraphTuple
+            The decoded graph. Nodes contain:
+
+        :param num_samples: tf.int32
+            The number of samples
+        :return:
+        """
+        # 12 - vx_mean, vy_mean, vz_mean, log_mass_mean, log_age_mean, log_metallicity_mean,  vx_scale,vy_scale,vz_scale,  log_mass_scale, log_age_scale, log_metallicity_scale
+        means = decoded_starcluster.nodes[:,0:6]
+        scales = decoded_starcluster.nodes[:,6:12]
+        shape = tf.concat([[num_samples],tf.shape(means)],axis=0)
+        samples = means + scales*tf.random.normal(shape=shape)
+        constrained_samples = tf.concat([samples[:,:,0:3], tf.exp(samples[:,:,3:6])],axis=-1)
+        return dict(unconstrained_graph= decoded_starcluster._replace(nodes=samples),
+                    constrained_graph=decoded_starcluster._replace(nodes=constrained_samples))
+
 
 class StarClusterTNetwork(snt.AbstractModule):
     """Use an EncodeProcessDecode graph network to compress starcluster graph"""
@@ -87,7 +111,9 @@ class StarClusterTNetwork(snt.AbstractModule):
                                          latent_size=g_encoder_latent_size,
                                          num_layers=g_encoder_num_layers)
 
-    def _build(self, gaia_graph, starcluster_graph):
+        self._starcluster_prob_field = StarclusterProbabilityField()
+
+    def _build(self, gaia_graph, starcluster_graph, num_samples):
         sc_encoded = self._starcluster_encoder(starcluster_graph)[-1]
         sc_decoded_graph = sc_encoded._repace(nodes=tf.zeros_like(sc_encoded.nodes),
                                           edges=tf.zeros_like(sc_encoded.edges),
@@ -99,34 +125,33 @@ class StarClusterTNetwork(snt.AbstractModule):
                                               edges=tf.zeros_like(sc_encoded.edges),
                                               globals=g_encoded.globals)
         g_decoded_graph = self._starcluster_decoder(g_decoded_graph)
+        g_decoded_samples = self._starcluster_prob_field(g_decoded_graph, num_samples)
+
+        sc_decoded_samples = self._starcluster_prob_field(sc_decoded_graph, num_samples)
+
+        auto_encoder_dist = tfp.distributions.Normal(loc=starcluster_graph.nodes, scale=1.)
+        #S, B, num_dims
+        auto_encoder_logprob = auto_encoder_dist.log_prob(sc_decoded_samples['unconstrained_samples'])
+        auto_encoder_loss = tf.reduce_mean(tf.reduce_sum(auto_encoder_logprob,axis=-1))
+
+        t_distribution = tfp.distributions.Normal(loc=g_encoded.globals,scale=1.)
+        #B, encoded_size
+        t_logprob = t_distribution.log_prob(sc_encoded.globals)
+        t_loss = tf.reduce_mean(tf.reduce_sum(t_logprob, axis=-1))
+
+        total_loss = t_loss + auto_encoder_loss
 
         return dict(g_encoded_globals=g_encoded.globals,
+                    g_decoded_samples=g_decoded_samples['constrained_samples'],
                     sc_encoded_globals=sc_encoded.globals,
-                    sc_decoded_graph=sc_decoded_graph,
-                    g_decoded_graph=g_decoded_graph)
+                    sc_sampled_samples=sc_decoded_samples['constrained_samples'],
+                    t_loss=t_loss,
+                    auto_encoder_loss=auto_encoder_loss,
+                    total_loss=total_loss)
 
-class StarclusterProbabilityField(snt.AbstractModule):
-    def __init__(self, name='StarclusterProbabilityField'):
-        super(StarclusterProbabilityField, self).__init__(name=name)
 
-    def _build(self, decoded_starcluster, num_samples):
-        """
-        sample the decoded nodes into the corresponding reconstruction parameters.
 
-        :param decoded_starcluster: GraphTuple
-            The decoded graph. Nodes contain:
 
-        :param num_samples: tf.int32
-            The number of samples
-        :return:
-        """
-        # 12 - vx_mean, vy_mean, vz_mean, log_mass_mean, log_age_mean, log_metallicity_mean,  vx_scale,vy_scale,vz_scale,  log_mass_scale, log_age_scale, log_metallicity_scale
-        means = decoded_starcluster.nodes[:,0:6]
-        scales = decoded_starcluster.nodes[:,6:12]
-        shape = tf.concat([[num_samples],tf.shape(means)],axis=0)
-        samples = means + scales*tf.random.normal(shape=shape)
-        constrained = tf.concat([samples[:,:,0:3], tf.exp(samples[:,:,3:6])],axis=-1)
-        return dict(sampled_starcluster_graph=decoded_starcluster._replace(nodes=constrained))
 
 
 
