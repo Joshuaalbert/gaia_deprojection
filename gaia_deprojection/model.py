@@ -3,6 +3,7 @@ import sonnet as snt
 import tensorflow as tf
 import numpy as np
 import tensorflow_probability as tfp
+from . import float_type
 
 
 class GaiaEncoder(snt.AbstractModule):
@@ -19,8 +20,8 @@ class GaiaEncoder(snt.AbstractModule):
                                                 latent_size=latent_size,
                                                 num_layers=num_layers)
 
-    def _build(self, inputs):
-        return self._network(inputs)
+    def _build(self, inputs, num_processing_steps):
+        return self._network(inputs, num_processing_steps)[-1]
 
 
 class StarClusterEncoder(snt.AbstractModule):
@@ -37,8 +38,8 @@ class StarClusterEncoder(snt.AbstractModule):
                                                 latent_size=latent_size,
                                                 num_layers=num_layers)
 
-    def _build(self, inputs):
-        return self._network(inputs)
+    def _build(self, inputs, num_processing_steps):
+        return self._network(inputs, num_processing_steps)[-1]
 
 
 class StarClusterDecoder(snt.AbstractModule):
@@ -61,8 +62,8 @@ class StarClusterDecoder(snt.AbstractModule):
                                                 latent_size=latent_size,
                                                 num_layers=num_layers)
 
-    def _build(self, inputs):
-        return self._network(inputs)
+    def _build(self, inputs, num_processing_steps):
+        return self._network(inputs,num_processing_steps)[-1]
 
 class StarclusterProbabilityField(snt.AbstractModule):
     def __init__(self, name='StarclusterProbabilityField'):
@@ -80,11 +81,13 @@ class StarclusterProbabilityField(snt.AbstractModule):
         :return:
         """
         # 12 - vx_mean, vy_mean, vz_mean, log_mass_mean, log_age_mean, log_metallicity_mean,  vx_scale,vy_scale,vz_scale,  log_mass_scale, log_age_scale, log_metallicity_scale
-        means = decoded_starcluster.nodes[:,0:6]
-        scales = decoded_starcluster.nodes[:,6:12]
+        means = decoded_starcluster.nodes[:,0:12]
+        tf.summary.image('decoded_mean', means[None,..., None], family='StarclusterProbabilityField')
+        scales = decoded_starcluster.nodes[:,12:24]
         shape = tf.concat([[num_samples],tf.shape(means)],axis=0)
-        samples = means + scales*tf.random.normal(shape=shape)
-        constrained_samples = tf.concat([samples[:,:,0:3], tf.exp(samples[:,:,3:6])],axis=-1)
+        samples = means + scales*tf.random.normal(shape=shape, dtype=float_type)
+        #TODO: constrained is not right per ordering
+        constrained_samples = tf.concat([samples[:,:,0:3], tf.exp(samples[:,:,3:12])],axis=-1)
         return dict(unconstrained_graph= decoded_starcluster._replace(nodes=samples),
                     constrained_graph=decoded_starcluster._replace(nodes=constrained_samples))
 
@@ -105,7 +108,8 @@ class StarClusterTNetwork(snt.AbstractModule):
         self._starcluster_encoder = StarClusterEncoder(encoded_size,
                                                        latent_size=sc_encoder_latent_size,
                                                        num_layers=sc_encoder_num_layers)
-        self._starcluster_decoder = StarClusterDecoder(latent_size=sc_decoder_latent_size,
+        self._starcluster_decoder = StarClusterDecoder(node_output_size=24,
+            latent_size=sc_decoder_latent_size,
                                                        num_layers=sc_decoder_num_layers)
         self._gaia_encoder = GaiaEncoder(encoded_size,
                                          latent_size=g_encoder_latent_size,
@@ -113,38 +117,44 @@ class StarClusterTNetwork(snt.AbstractModule):
 
         self._starcluster_prob_field = StarclusterProbabilityField()
 
-    def _build(self, gaia_graph, starcluster_graph, num_samples):
-        sc_encoded = self._starcluster_encoder(starcluster_graph)[-1]
-        sc_decoded_graph = sc_encoded._repace(nodes=tf.zeros_like(sc_encoded.nodes),
+    def _build(self, gaia_graph, starcluster_graph, num_samples, num_processing_steps):
+        sc_encoded = self._starcluster_encoder(starcluster_graph, num_processing_steps)
+        sc_decoded_graph = sc_encoded._replace(nodes=tf.zeros_like(sc_encoded.nodes),
                                           edges=tf.zeros_like(sc_encoded.edges),
                                           globals=sc_encoded.globals)
-        sc_decoded_graph = self._starcluster_decoder(sc_decoded_graph)
 
-        g_encoded = self._gaia_encoder(gaia_graph)[-1]
-        g_decoded_graph = sc_encoded._repace(nodes=tf.zeros_like(sc_encoded.nodes),
+        sc_decoded_graph = self._starcluster_decoder(sc_decoded_graph, num_processing_steps)
+
+        g_encoded = self._gaia_encoder(gaia_graph, num_processing_steps)
+        g_decoded_graph = sc_encoded._replace(nodes=tf.zeros_like(sc_encoded.nodes),
                                               edges=tf.zeros_like(sc_encoded.edges),
                                               globals=g_encoded.globals)
-        g_decoded_graph = self._starcluster_decoder(g_decoded_graph)
+        g_decoded_graph = self._starcluster_decoder(g_decoded_graph, num_processing_steps)
         g_decoded_samples = self._starcluster_prob_field(g_decoded_graph, num_samples)
 
         sc_decoded_samples = self._starcluster_prob_field(sc_decoded_graph, num_samples)
 
-        auto_encoder_dist = tfp.distributions.Normal(loc=starcluster_graph.nodes, scale=1.)
-        #S, B, num_dims
-        auto_encoder_logprob = auto_encoder_dist.log_prob(sc_decoded_samples['unconstrained_samples'])
-        auto_encoder_loss = tf.reduce_mean(tf.reduce_sum(auto_encoder_logprob,axis=-1))
+        with tf.name_scope("Losses"):
+            with tf.name_scope('AutoencoderLoss', values=[starcluster_graph.nodes,
+                                                          sc_decoded_samples['unconstrained_graph'].nodes]):
 
-        t_distribution = tfp.distributions.Normal(loc=g_encoded.globals,scale=1.)
-        #B, encoded_size
-        t_logprob = t_distribution.log_prob(sc_encoded.globals)
-        t_loss = tf.reduce_mean(tf.reduce_sum(t_logprob, axis=-1))
+                auto_encoder_dist = tfp.distributions.Normal(loc=starcluster_graph.nodes, scale=1.)
+                #S, B, num_dims
+                auto_encoder_logprob = auto_encoder_dist.log_prob(sc_decoded_samples['unconstrained_graph'].nodes)
+                auto_encoder_loss = tf.reduce_mean(tf.reduce_sum(auto_encoder_logprob,axis=-1), name='autoencoder_loss')
 
-        total_loss = t_loss + auto_encoder_loss
+            with tf.name_scope("TJunctionLoss",values=[g_encoded.globals, sc_encoded.globals]):
+                t_distribution = tfp.distributions.Normal(loc=g_encoded.globals,scale=1.)
+                #B, encoded_size
+                t_logprob = t_distribution.log_prob(sc_encoded.globals)
+                t_loss = tf.reduce_mean(tf.reduce_sum(t_logprob, axis=-1), name='t_junction_loss')
+
+            total_loss = tf.math.add(t_loss, auto_encoder_loss, name='total_loss')
 
         return dict(g_encoded_globals=g_encoded.globals,
-                    g_decoded_samples=g_decoded_samples['constrained_samples'],
+                    g_decoded_samples=g_decoded_samples['constrained_graph'].nodes,
                     sc_encoded_globals=sc_encoded.globals,
-                    sc_sampled_samples=sc_decoded_samples['constrained_samples'],
+                    sc_sampled_samples=sc_decoded_samples['constrained_graph'].nodes,
                     t_loss=t_loss,
                     auto_encoder_loss=auto_encoder_loss,
                     total_loss=total_loss)

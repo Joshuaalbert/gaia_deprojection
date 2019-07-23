@@ -99,9 +99,9 @@ class EncodeProcessDecode(snt.AbstractModule):
                  num_layers=2,
                  name="EncodeProcessDecode"):
         super(EncodeProcessDecode, self).__init__(name=name)
-        self._encoder = MLPGraphIndependent()
-        self._core = MLPGraphNetwork()
-        self._decoder = MLPGraphIndependent()
+        self._encoder = MLPGraphIndependent(latent_size, num_layers=1)
+        self._core = MLPGraphNetwork(latent_size, num_layers=num_layers)
+        self._decoder = MLPGraphIndependent(latent_size, num_layers=1)
         # Transforms the outputs into the appropriate shapes.
         if edge_output_size is None:
             edge_fn = None

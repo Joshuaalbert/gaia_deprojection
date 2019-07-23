@@ -80,3 +80,5 @@ webencodings==0.5.1
 Werkzeug==0.14.1
 widgetsnbextension==3.4.2
 networkx==2.2
+graph_nets
+dask
